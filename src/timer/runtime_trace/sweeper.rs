@@ -98,20 +98,19 @@ impl RecyclingBins {
         loop {
             let mut recycle_unit_heap = self.recycle_unit_heap.lock().await;
 
-            let now: u64 = get_timestamp();
+            let now: u64 = timestamp();
             let mut duration: Option<Duration> = None;
             for _ in 0..200 {
-                if let Some(recycle_flag) = (&recycle_unit_heap).peek().map(|r| r.0.deadline <= now)
-                {
+                if let Some(recycle_flag) = recycle_unit_heap.peek().map(|r| r.0.deadline <= now) {
                     if !recycle_flag {
-                        duration = (&recycle_unit_heap)
+                        duration = recycle_unit_heap
                             .peek()
                             .map(|r| r.0.deadline - now)
                             .map(Duration::from_secs);
                         break;
                     }
 
-                    if let Some(recycle_unit) = (&mut recycle_unit_heap).pop().map(|v| v.0) {
+                    if let Some(recycle_unit) = recycle_unit_heap.pop().map(|v| v.0) {
                         //handle send-error.
                         self.send_timer_event(TimerEvent::TimeoutTask(
                             recycle_unit.task_id,
@@ -139,14 +138,19 @@ impl RecyclingBins {
             .unwrap_or_else(|e| error!(" `send_timer_event` : {}", e));
     }
 
+    // FIXME: https://github.com/BinChengZhao/delay-timer/issues/28
+    // Due to the large number of tasks upstream, timeout units can pile up exceptionally high.
+    // A large amount of memory may be occupied here.
     pub(crate) async fn add_recycle_unit(self: Arc<Self>) {
         'loopLayer: loop {
+            // TODO: Internal (shrink -> cycle-bins) or change the data structure.
+
             for _ in 0..200 {
                 match self.recycle_unit_sources.recv().await {
                     Ok(recycle_unit) => {
                         let mut recycle_unit_heap = self.recycle_unit_heap.lock().await;
 
-                        (&mut recycle_unit_heap).push(Reverse(recycle_unit));
+                        recycle_unit_heap.push(Reverse(recycle_unit));
                     }
 
                     Err(_) => {
@@ -164,9 +168,9 @@ impl RecyclingBins {
         let duration = duration.unwrap_or_else(|| Duration::from_secs(3));
         match self.runtime_kind {
             RuntimeKind::Smol => {
-                Timer::after(duration).await;
+                AsyncTimer::after(duration).await;
             }
-            #[cfg(feature = "tokio-support")]
+
             RuntimeKind::Tokio => {
                 sleep_by_tokio(duration).await;
             }
@@ -180,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_task_valid() -> AnyResult<()> {
-        use super::{get_timestamp, RecycleUnit, RecyclingBins, RuntimeKind, TimerEvent};
+        use super::{timestamp, RecycleUnit, RecyclingBins, RuntimeKind, TimerEvent};
         use smol::{
             block_on,
             channel::{unbounded, TryRecvError},
@@ -211,7 +215,7 @@ mod tests {
             })
         });
 
-        let deadline = get_timestamp() + 5;
+        let deadline = timestamp() + 5;
 
         for i in 1..10 {
             recycle_unit_sender.try_send(RecycleUnit::new(deadline, i, (i * i) as i64))?;

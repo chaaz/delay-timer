@@ -4,7 +4,7 @@
 /// Collection of functions related to shell commands and processes.
 pub mod shell_command {
     use crate::prelude::*;
-    use anyhow::*;
+    use anyhow::Error as AnyhowError;
 
     use async_trait::async_trait;
 
@@ -63,9 +63,7 @@ pub mod shell_command {
     /// Abstraction of command methods in multiple libraries.
     pub trait CommandUnify<Child: ChildUnify>: Sized {
         /// Constructs a new Command for launching the program at path program.
-        fn new<S: AsRef<OsStr>>(program: S) -> Self {
-            Self::new(program.as_ref())
-        }
+        fn new<S: AsRef<OsStr>>(program: S) -> Self;
 
         /// Adds multiple arguments to pass to the program.
         fn args<I, S>(&mut self, args: I) -> &mut Self
@@ -88,17 +86,17 @@ pub mod shell_command {
 
     impl_command_unify!(Command => StdChild,SmolCommand => SmolChild);
 
-    cfg_tokio_support!(
-        use tokio::process::Command as TokioCommand;
-        use tokio::process::Child as TokioChild;
-        use std::convert::TryInto;
-        impl_command_unify!(TokioCommand => TokioChild);
-
-    );
+    use std::convert::TryInto;
+    use tokio::process::Child as TokioChild;
+    use tokio::process::Command as TokioCommand;
+    impl_command_unify!(TokioCommand => TokioChild);
 
     #[async_trait]
     /// Trait abstraction of multiple library process handles.
     pub trait ChildUnify: Send + Sync {
+        /// Executes the command as a child process, waiting for it to finish and returning the status that it exited with.
+        async fn wait(self) -> AnyResult<ExitStatus>;
+
         /// Executes the command as a child process, waiting for it to finish and collecting all of its output.
         async fn wait_with_output(self) -> AnyResult<Output>;
         /// Convert stdout to stdio.
@@ -110,6 +108,9 @@ pub mod shell_command {
 
     #[async_trait]
     impl ChildUnify for StdChild {
+        async fn wait(self) -> AnyResult<ExitStatus> {
+            Ok(self.wait().await?)
+        }
         async fn wait_with_output(self) -> AnyResult<Output> {
             Ok(self.wait_with_output()?)
         }
@@ -124,6 +125,20 @@ pub mod shell_command {
 
     #[async_trait]
     impl ChildUnify for SmolChild {
+        async fn wait(mut self) -> AnyResult<ExitStatus> {
+            #[cfg(target_family = "windows")]
+            {
+                return Ok(ExitStatus::from_raw(
+                    self.status().await?.code().unwrap_or(1) as u32,
+                ));
+            }
+
+            #[cfg(target_family = "unix")]
+            return Ok(ExitStatus::from_raw(
+                self.status().await?.code().unwrap_or(-1),
+            ));
+        }
+
         async fn wait_with_output(self) -> AnyResult<Output> {
             Ok(self.output().await?)
         }
@@ -140,44 +155,72 @@ pub mod shell_command {
         }
     }
 
-    cfg_tokio_support!(
-        #[async_trait]
-        impl ChildUnify for TokioChild {
-            async fn wait_with_output(self) -> AnyResult<Output> {
-                Ok(self.wait_with_output().await?)
-            }
-
-            async fn stdout_to_stdio(&mut self) -> Option<Stdio> {
-                self.stdout.take().map(|s| s.try_into().ok()).flatten()
-            }
-
-            // Attempts to force the child to exit, but does not wait for the request to take effect.
-            // On Unix platforms, this is the equivalent to sending a SIGKILL.
-            // Note that on Unix platforms it is possible for a zombie process to remain after a kill is sent;
-            // to avoid this, the caller should ensure that either child.wait().await or child.try_wait() is invoked successfully.
-            fn kill(&mut self) -> AnyResult<()> {
-                Ok(self.start_kill()?)
-            }
+    #[async_trait]
+    impl ChildUnify for TokioChild {
+        async fn wait(self) -> AnyResult<ExitStatus> {
+            Ok(self.wait().await?)
         }
-    );
-    #[derive(Debug)]
+
+        async fn wait_with_output(self) -> AnyResult<Output> {
+            Ok(self.wait_with_output().await?)
+        }
+
+        async fn stdout_to_stdio(&mut self) -> Option<Stdio> {
+            self.stdout.take().and_then(|s| s.try_into().ok())
+        }
+
+        // Attempts to force the child to exit, but does not wait for the request to take effect.
+        // On Unix platforms, this is the equivalent to sending a SIGKILL.
+        // Note that on Unix platforms it is possible for a zombie process to remain after a kill is sent;
+        // to avoid this, the caller should ensure that either child.wait().await or child.try_wait() is invoked successfully.
+        fn kill(&mut self) -> AnyResult<()> {
+            Ok(self.start_kill()?)
+        }
+    }
+    #[derive(Debug, Default)]
     /// Guarding of process handles.
     pub struct ChildGuard<Child: ChildUnify> {
         pub(crate) child: Option<Child>,
     }
 
     impl<Child: ChildUnify> ChildGuard<Child> {
-        pub(crate) fn new(child: Child) -> Self {
+        /// Build a `ChildGuard` with `Child`.
+        pub fn new(child: Child) -> Self {
             let child = Some(child);
             Self { child }
         }
 
-        pub(crate) async fn wait_with_output(mut self) -> AnyResult<Output> {
+        /// Take inner `Child` from `ChildGuard`.
+        pub fn take_inner(mut self) -> Option<Child> {
+            self.child.take()
+        }
+
+        /// Await on `ChildGuard` and get `ExitStatus`.
+        pub async fn wait(mut self) -> Result<ExitStatus, CommandChildError> {
             if let Some(child) = self.child.take() {
-                return child.wait_with_output().await;
+                return child
+                    .wait()
+                    .await
+                    .map_err(|e| CommandChildError::DisCondition(e.to_string()));
             }
 
-            Err(anyhow!("Without child for waiting."))
+            Err(CommandChildError::DisCondition(
+                "Without child for waiting.".to_string(),
+            ))
+        }
+
+        /// Await on `ChildGuard` and get `Output`.
+        pub async fn wait_with_output(mut self) -> Result<Output, CommandChildError> {
+            if let Some(child) = self.child.take() {
+                return child
+                    .wait_with_output()
+                    .await
+                    .map_err(|e| CommandChildError::DisCondition(e.to_string()));
+            }
+
+            Err(CommandChildError::DisCondition(
+                "Without child for waiting.".to_string(),
+            ))
         }
     }
 
@@ -212,7 +255,7 @@ pub mod shell_command {
     //  after which it should be split into unblock().
     pub async fn parse_and_run<Child: ChildUnify, Command: CommandUnify<Child>>(
         input: &str,
-    ) -> Result<ChildGuardList<Child>> {
+    ) -> Result<ChildGuardList<Child>, CommandChildError> {
         // Check to see if process_linked_list is also automatically dropped out of scope
         // by ERROR's early return and an internal kill method is executed.
 
@@ -226,11 +269,14 @@ pub mod shell_command {
         for mut command in commands {
             let check_redirect_result = _has_redirect_file(command);
             if check_redirect_result.is_some() {
-                command = _remove_angle_bracket_command(command)?;
+                command = _remove_angle_bracket_command(command)
+                    .map_err(|e| CommandChildError::DisCondition(e.to_string()))?;
             }
 
             let mut parts = command.trim().split_whitespace();
-            let command = parts.next().ok_or_else(|| anyhow!("Without next part"))?;
+            let command = parts
+                .next()
+                .ok_or_else(|| CommandChildError::DisCondition("Without next part".to_string()))?;
             let args = parts;
 
             // Standard input to the current process.
@@ -256,15 +302,18 @@ pub mod shell_command {
 
             let process: Child;
             let end_flag = if let Some(stdout_result) = check_redirect_result {
-                let stdout = stdout_result?;
-                process = output.stdout(stdout).spawn()?;
+                let stdout =
+                    stdout_result.map_err(|e| CommandChildError::DisCondition(e.to_string()))?;
+                process = output
+                    .stdout(stdout)
+                    .spawn()
+                    .map_err(|e| CommandChildError::DisCondition(e.to_string()))?;
                 true
             } else {
-                let stdout;
                 // if commands.peek().is_some() {
                 //     // there is another command piped behind this one
                 //     // prepare to send output to the next command
-                stdout = Stdio::piped();
+                let stdout = Stdio::piped();
                 // } else {
                 //     // there are no more commands piped behind this one
                 //     // send output to shell stdout
@@ -273,7 +322,10 @@ pub mod shell_command {
                 //     stdout = Stdio::inherit();
                 // };
 
-                process = output.stdout(stdout).spawn()?;
+                process = output
+                    .stdout(stdout)
+                    .spawn()
+                    .map_err(|e| CommandChildError::DisCondition(e.to_string()))?;
                 false
             };
 
@@ -307,7 +359,7 @@ pub mod shell_command {
     }
 
     #[cfg(SPLIT_INCLUSIVE_COMPATIBLE)]
-    fn _has_redirect_file(command: &str) -> Option<Result<File>> {
+    fn _has_redirect_file(command: &str) -> Option<Result<File, AnyhowError>> {
         let angle_bracket = if command.contains(">>") {
             ">>"
         } else if command.contains('>') {
@@ -324,14 +376,14 @@ pub mod shell_command {
     }
 
     //After confirming that there is a redirect file, parse the command before the command '>'.
-    fn _remove_angle_bracket_command(command: &str) -> Result<&str> {
+    fn _remove_angle_bracket_command(command: &str) -> Result<&str, AnyhowError> {
         let mut sub_command_inner = command.trim().split('>');
         sub_command_inner
             .next()
             .ok_or_else(|| anyhow!("can't parse ...."))
     }
 
-    fn create_stdio_file(angle_bracket: &str, filename: &str) -> Result<File> {
+    fn create_stdio_file(angle_bracket: &str, filename: &str) -> Result<File, AnyhowError> {
         let mut file_tmp = OpenOptions::new();
         file_tmp.write(true).create(true);
 

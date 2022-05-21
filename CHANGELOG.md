@@ -1,3 +1,55 @@
+# Version 0.11.1
+
+## Changed
+
+- Optimize internal code for better clarity and expression.
+
+- Fixed a bug where task execution time is unstable.([#36](https://github.com/BinChengZhao/delay-timer/issues/36))
+
+### Details
+
+# Version 0.11.0 
+
+## Changed
+- Optimized the entire delay-timer usage by removing macros for creating asynchronous tasks and now allowing users to use a closure that returns a Future.
+
+- The default internal runtime currently used by 'Tokio', 'smol' can also be manually enabled by the user.
+
+- Updated lots of utility cases, lots of documentation, and dependency updates.
+
+- Fixed a bug where tasks were executed ahead of time.([#33](https://github.com/BinChengZhao/delay-timer/issues/33))
+
+### Details
+
+Major refactoring of 'task execution'.
+
+# Version 0.10.1 
+
+## Changed
+Fix a strange compilation error that was leaked by the compiler. ([#30](https://github.com/BinChengZhao/delay-timer/issues/30)), thanks `elderbig` !
+
+# Version 0.10.0 
+
+## Changed
+Optimized the use of internal `time-wheel` memory. ([#28](https://github.com/BinChengZhao/delay-timer/issues/28)), thanks `elderbig` !
+
+### Details
+There is a `time-wheel` in `delay-timer`, which is the carrier of all tasks.
+
+The time wheel uses slots (time scales) as units, each slot corresponds to a hash table, when a slot is rotated to it will execute the task that is already ready internally, when the task is executed it will move from one slot to another. In order to have enough capacity to store the tasks, there may be a memory allocation here, so that by the time the whole time wheel is traversed, each internal time wheel-slot will have rich memory capacity, and when there are many tasks the memory occupied by the whole time wheel will be very large. So it will be necessary to shrink the memory in time.
+
+This change is to shrink the memory in time after each round of training slots and executing tasks to ensure that the slots have a basic and compact capacity.
+
+# Version 0.9.2
+
+## Changed
+Add a new Error enumeration `CommandChildError`!
+
+# Version 0.9.1 
+
+## Changed
+Tweak the compile script ([#24](https://github.com/BinChengZhao/delay-timer/issues/24)), thanks `chaaz` !
+
 # Version 0.9.0 
 
 v0.9.0 New features:

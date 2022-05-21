@@ -122,7 +122,7 @@ pub(crate) struct RecyclingBinWorker {
 
 impl EventHandle {
     fn recycling_task(&mut self) {
-        async_spawn(
+        async_spawn_by_smol(
             self.sub_wokers
                 .recycling_bin_woker
                 .inner
@@ -130,23 +130,21 @@ impl EventHandle {
                 .add_recycle_unit(),
         )
         .detach();
-        async_spawn(self.sub_wokers.recycling_bin_woker.inner.clone().recycle()).detach();
+        async_spawn_by_smol(self.sub_wokers.recycling_bin_woker.inner.clone().recycle()).detach();
     }
 
-    cfg_tokio_support!(
-        // `async_spawn_by_tokio` 'must be called from the context of Tokio runtime configured
-        // with either `basic_scheduler` or `threaded_scheduler`'.
-        fn recycling_task_by_tokio(&mut self) {
-            async_spawn_by_tokio(
-                self.sub_wokers
-                    .recycling_bin_woker
-                    .inner
-                    .clone()
-                    .add_recycle_unit(),
-            );
-            async_spawn_by_tokio(self.sub_wokers.recycling_bin_woker.inner.clone().recycle());
-        }
-    );
+    // `async_spawn_by_tokio` 'must be called from the context of Tokio runtime configured
+    // with either `basic_scheduler` or `threaded_scheduler`'.
+    fn recycling_task_by_tokio(&mut self) {
+        async_spawn_by_tokio(
+            self.sub_wokers
+                .recycling_bin_woker
+                .inner
+                .clone()
+                .add_recycle_unit(),
+        );
+        async_spawn_by_tokio(self.sub_wokers.recycling_bin_woker.inner.clone().recycle());
+    }
 
     // handle all event.
     // TODO: Add TestUnit.
@@ -160,7 +158,7 @@ impl EventHandle {
 
         match runtime_kind {
             RuntimeKind::Smol => self.recycling_task(),
-            #[cfg(feature = "tokio-support")]
+
             RuntimeKind::Tokio => self.recycling_task_by_tokio(),
         };
     }
@@ -275,17 +273,20 @@ impl EventHandle {
 
     // Add task to wheel_queue  slot
     fn add_task(&mut self, mut task: Box<Task>) -> AnyResult<TaskMark> {
-        let second_hand = self.shared_header.second_hand.load(Acquire);
+        let second_hand = self.shared_header.second_hand.current_second_hand();
 
         let exec_time: u64 = task
             .get_next_exec_timestamp()
             .ok_or_else(|| anyhow!("can't get_next_exec_timestamp in {}", &task.task_id))?;
 
         let timestamp = self.shared_header.global_time.load(Acquire);
+
+        // Put task on next slot.
         let time_seed: u64 = exec_time
             .checked_sub(timestamp)
-            .unwrap_or_else(|| task.task_id % DEFAULT_TIMER_SLOT_COUNT)
-            + second_hand;
+            .unwrap_or(task.task_id % DEFAULT_TIMER_SLOT_COUNT)
+            + second_hand
+            + 1;
         let slot_seed: u64 = time_seed % DEFAULT_TIMER_SLOT_COUNT;
 
         let cylinder_line = time_seed / DEFAULT_TIMER_SLOT_COUNT;
@@ -359,7 +360,7 @@ impl EventHandle {
         };
         task.clear_cylinder_line();
 
-        let slot_seed = self.shared_header.second_hand.load(Acquire) + 1;
+        let slot_seed = self.shared_header.second_hand.current_second_hand() + 1;
 
         if let Some(mut slot) = self.shared_header.wheel_queue.get_mut(&slot_seed) {
             slot.value_mut().add_task(task);

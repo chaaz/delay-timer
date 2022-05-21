@@ -2,11 +2,11 @@
 //! It is the core of the entire cycle scheduling task.
 use crate::prelude::*;
 
-use crate::entity::get_timestamp;
+use crate::entity::timestamp;
 use crate::entity::RuntimeKind;
 
 use std::mem::replace;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{Acquire, Release};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -15,13 +15,15 @@ use smol::Timer as smolTimer;
 pub(crate) const DEFAULT_TIMER_SLOT_COUNT: u64 = 3600;
 
 /// The clock of timer core.
+#[derive(Debug)]
 struct Clock {
     inner: ClockInner,
 }
 
+#[derive(Debug)]
 enum ClockInner {
     Sc(SmolClock),
-    #[cfg(feature = "tokio-support")]
+
     Tc(TokioClock),
 }
 
@@ -37,7 +39,7 @@ impl ClockInner {
             RuntimeKind::Smol => {
                 ClockInner::Sc(SmolClock::new(Instant::now(), Duration::from_secs(1)))
             }
-            #[cfg(feature = "tokio-support")]
+
             RuntimeKind::Tokio => ClockInner::Tc(TokioClock::new(
                 time::Instant::now(),
                 Duration::from_secs(1),
@@ -50,32 +52,28 @@ impl Clock {
     async fn tick(&mut self) {
         match self.inner {
             ClockInner::Sc(ref mut smol_clock) => smol_clock.tick().await,
-            #[cfg(feature = "tokio-support")]
+
             ClockInner::Tc(ref mut tokio_clock) => tokio_clock.tick().await,
-        }
+        };
     }
 }
-cfg_tokio_support!(
-    use tokio::time::{Interval, interval_at, self};
+use tokio::time::{self, interval_at, Interval};
 
-    #[derive(Debug)]
-    struct TokioClock{
-        inner : Interval
+#[derive(Debug)]
+struct TokioClock {
+    inner: Interval,
+}
+
+impl TokioClock {
+    pub fn new(start: time::Instant, period: Duration) -> Self {
+        let inner = interval_at(start, period);
+        TokioClock { inner }
     }
 
-    impl TokioClock{
-
-        pub fn new(start: time::Instant, period: Duration) -> Self{
-            let inner = interval_at(start, period);
-            TokioClock{inner}
-        }
-
-        pub async fn tick(&mut self){
-            self.inner.tick().await;
-        }
+    pub async fn tick(&mut self) {
+        self.inner.tick().await;
     }
-
-);
+}
 
 #[derive(Debug)]
 struct SmolClock {
@@ -146,13 +144,15 @@ pub enum TimerEvent {
     /// Take the initiative to perform once Task.
     AdvanceTask(u64),
 }
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 /// delay-timer internal timer wheel core.
 pub struct Timer {
     /// Event sender that provides events to `EventHandle` processing.
-    pub(crate) timer_event_sender: TimerEventSender,
+    timer_event_sender: TimerEventSender,
+    #[allow(dead_code)]
     status_report_sender: Option<AsyncSender<i32>>,
-    pub(crate) shared_header: SharedHeader,
+    shared_header: SharedHeader,
+    clock: Clock,
 }
 
 // In any case, the task is not executed in the Scheduler,
@@ -161,10 +161,14 @@ pub struct Timer {
 impl Timer {
     /// Initialize a timer wheel core.
     pub fn new(timer_event_sender: TimerEventSender, shared_header: SharedHeader) -> Self {
+        let runtime_kind = shared_header.runtime_instance.kind;
+        let clock = Clock::new(runtime_kind);
+
         Timer {
             timer_event_sender,
             status_report_sender: None,
             shared_header,
+            clock,
         }
     }
 
@@ -176,23 +180,22 @@ impl Timer {
     /// Offset the current slot by one when reading it,
     /// so event_handle can be easily inserted into subsequent slots.
     pub(crate) fn next_position(&mut self) -> u64 {
-        self.shared_header
-            .second_hand
-            .fetch_update(Release, Relaxed, |x| {
-                Some((x + 1) % DEFAULT_TIMER_SLOT_COUNT)
-            })
-            .unwrap_or_else(|e| e)
+        self.shared_header.second_hand.next().unwrap_or_else(|e| e)
+    }
+
+    /// Time goes on, the clock ticks.
+    pub(crate) async fn lapse(&mut self) {
+        self.clock.tick().await;
+        self.next_position();
     }
 
     /// Return a future can pool it for Schedule all cycles task.
     pub(crate) async fn async_schedule(&mut self) {
-        // if that overtime , i run it not block
-        let mut second_hand;
-        let mut next_second_hand;
-        let mut timestamp;
+        // if that overtime , run it not block
 
-        let runtime_kind = self.shared_header.runtime_instance.kind;
-        let mut clock = Clock::new(runtime_kind);
+        let mut second_hand = self.second_hand();
+        let mut next_second_hand = second_hand + 1;
+        let mut current_timestamp = timestamp();
 
         loop {
             //TODO: replenish ending single, for stop current jod and thread.
@@ -200,12 +203,18 @@ impl Timer {
                 return;
             }
 
-            second_hand = self.next_position();
-            timestamp = get_timestamp();
-            self.shared_header.global_time.store(timestamp, Release);
+            self.shared_header
+                .global_time
+                .store(current_timestamp, Release);
             let task_ids;
 
             {
+                // TODO:
+                // Attempt to batch take out tasks and execute them,
+                // marking the status for this batch.
+                //
+                // Attempt to re-queue the `cancel` event into the channel
+                // if the user `cancel` task is running.
                 if let Some(mut slot_mut) = self.shared_header.wheel_queue.get_mut(&second_hand) {
                     task_ids = slot_mut.value_mut().arrival_time_tasks();
                 } else {
@@ -214,8 +223,15 @@ impl Timer {
                 }
             }
 
-            trace!("timestamp: {}, task_ids: {:?}", timestamp, task_ids);
+            trace!(
+                "second_hand: {}, timestamp: {}, task_ids: {:?}",
+                second_hand,
+                current_timestamp,
+                task_ids
+            );
 
+            // Centralize task processing to avoid duplicate lock requests and releases.
+            // FIXME: https://github.com/BinChengZhao/delay-timer/issues/29
             for task_id in task_ids {
                 let task_option: Option<Task>;
 
@@ -229,18 +245,35 @@ impl Timer {
                 }
 
                 if let Some(task) = task_option {
-                    next_second_hand = (second_hand + 1) % DEFAULT_TIMER_SLOT_COUNT;
-                    self.maintain_task(task, timestamp, next_second_hand)
+                    self.maintain_task(task, current_timestamp, next_second_hand)
                         .await
                         .map_err(|e| error!("{}", e))
                         .ok();
                 }
             }
 
-            clock.tick().await;
+            {
+                // When the operation is finished with the task, shrink the container in time
+                // To avoid the overall time-wheel from occupying too much memory.
+                if let Some(mut slot_mut) = self.shared_header.wheel_queue.get_mut(&second_hand) {
+                    slot_mut.shrink();
+                }
+            }
+
+            self.lapse().await;
+
+            second_hand = self.second_hand();
+            next_second_hand = (second_hand + 1) % DEFAULT_TIMER_SLOT_COUNT;
+            current_timestamp = timestamp();
         }
     }
 
+    /// Access to the second-hand
+    pub(crate) fn second_hand(&self) -> u64 {
+        self.shared_header.second_hand.current_second_hand()
+    }
+
+    /// Send timer-event to event-handle.
     pub(crate) async fn send_timer_event(
         &mut self,
         task_id: u64,
@@ -294,9 +327,10 @@ impl Timer {
         task_context
             .task_id(task_id)
             .record_id(record_id)
-            .timer_event_sender(self.timer_event_sender.clone());
+            .timer_event_sender(self.timer_event_sender.clone())
+            .runtime_kind(self.shared_header.runtime_instance.kind);
 
-        let task_handler_box = (task.get_body())(task_context);
+        let task_handler_box = self.routine_exec(&*(task.routine.0), task_context);
 
         let delay_task_handler_box_builder = DelayTaskHandlerBoxBuilder::default();
         let tmp_task_handler_box = delay_task_handler_box_builder
@@ -333,11 +367,16 @@ impl Timer {
             .get_next_exec_timestamp()
             .ok_or_else(|| anyhow!("can't get_next_exec_timestamp in task :{}", task.task_id))?;
 
+        // cylinder_line = 24
+        // slot_seed = 60
+        // when-init: slot_seed+=1 == 61
+        // when-on-slot61-exec: (task_excute_timestamp - timestamp + next_second_hand) % slot_seed == 61
+
         // Time difference + next second hand % DEFAULT_TIMER_SLOT_COUNT
-        let step = task_excute_timestamp.checked_sub(timestamp).unwrap_or(1) + next_second_hand;
+        let step = task_excute_timestamp.checked_sub(timestamp).unwrap_or(1);
         let cylinder_line = step / DEFAULT_TIMER_SLOT_COUNT;
         task.set_cylinder_line(cylinder_line);
-        let slot_seed = step % DEFAULT_TIMER_SLOT_COUNT;
+        let slot_seed = (step + next_second_hand) % DEFAULT_TIMER_SLOT_COUNT;
 
         {
             let mut slot_mut = self
@@ -368,12 +407,27 @@ impl Timer {
         );
         Ok(())
     }
+
+    #[inline(always)]
+    fn routine_exec(
+        &self,
+        routine: &(dyn Routine<TokioHandle = TokioJoinHandle<()>, SmolHandle = SmolJoinHandler<()>>
+              + 'static
+              + Send),
+
+        task_context: TaskContext,
+    ) -> Box<dyn DelayTaskHandler> {
+        match task_context.runtime_kind {
+            RuntimeKind::Smol => create_delay_task_handler(routine.spawn_by_smol(task_context)),
+            RuntimeKind::Tokio => create_delay_task_handler(routine.spawn_by_tokio(task_context)),
+        }
+    }
 }
 
 mod tests {
 
-    #[test]
-    fn test_next_position() {
+    #[tokio::test]
+    async fn test_next_position() {
         use super::{SharedHeader, Timer, TimerEvent};
         use smol::channel::unbounded;
         use std::sync::atomic::Ordering;
@@ -386,6 +440,7 @@ mod tests {
         timer
             .shared_header
             .second_hand
+            .inner
             .store(3599, Ordering::SeqCst);
         assert_eq!(timer.next_position(), 3599);
         assert_eq!(timer.next_position(), 0);
